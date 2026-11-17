@@ -4,11 +4,14 @@ import asyncio
 import base64
 from collections import defaultdict
 from dataclasses import dataclass
+import hashlib
+from http import HTTPStatus
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
-from aiohttp import ClientSession, hdrs, web
+from aiohttp import ClientResponseError, ClientSession, hdrs, web
 from aiohttp.test_utils import TestServer
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -17,6 +20,8 @@ import pytest
 
 from deebot_client.authentication import Authenticator, create_rest_config
 from deebot_client.exceptions import (
+    ApiError,
+    ApiTimeoutError,
     AuthenticationError,
     DeviceVerificationRequiredError,
     InvalidAuthenticationError,
@@ -40,8 +45,10 @@ _PUBLIC_KEY_CONFIG = "PUBLIC.KEY.CONFIG"
 class _RecordedRequest:
     """Request received by the fake Ecovacs api."""
 
+    method: str
     path: str
     query: dict[str, str]
+    headers: dict[str, str]
     json: dict[str, Any] | None
 
 
@@ -50,12 +57,14 @@ class _FakeEcovacsApi:
 
     Requests are routed by the last segment of their path, so a test only needs
     to configure the endpoints it cares about. Requesting an endpoint without a
-    payload fails with a 404 instead of silently succeeding.
+    payload fails with a 404 instead of silently succeeding. Statuses queued in
+    ``statuses`` are answered first, one per request, without a body.
     """
 
     def __init__(self, responses: dict[str, Any]) -> None:
         self.url = ""
         self.responses = responses
+        self.statuses: defaultdict[str, list[int]] = defaultdict(list)
         self.requests: defaultdict[str, list[_RecordedRequest]] = defaultdict(list)
         self._server: TestServer | None = None
 
@@ -77,14 +86,18 @@ class _FakeEcovacsApi:
         endpoint = request.path.rpartition("/")[2]
         self.requests[endpoint].append(
             _RecordedRequest(
+                method=request.method,
                 path=request.path,
                 query=dict(request.query),
+                headers=dict(request.headers),
                 json=orjson.loads(await request.read())
                 if request.can_read_body
                 else None,
             )
         )
 
+        if self.statuses[endpoint]:
+            return web.Response(status=self.statuses[endpoint].pop(0))
         if endpoint not in self.responses:
             raise web.HTTPNotFound
         body = orjson.dumps(self.responses[endpoint])
@@ -601,3 +614,152 @@ async def test_teardown_lets_account_credentials_be_stored(auth: Authenticator) 
     assert stored == [
         AccountCredentials(access_token="access-token", user_id="user-id")  # noqa: S106
     ]
+
+
+_GET_PATH = "appsvr/fake/get_endpoint"
+_APP_SIGN_SALT = "ecovacs2ea31cf06e6711eaa0aff7b9558a534e"
+_PIN_PARAM = "secret-business-value"
+
+
+def _assert_no_secret(text: str) -> None:
+    for secret in ("portal-token", _PIN_PARAM, "user-id"):
+        assert secret not in text
+
+
+async def test_get_authenticated_sends_app_headers_and_auth_query(
+    api: _FakeEcovacsApi, auth: Authenticator
+) -> None:
+    api.responses["get_endpoint"] = {"ret": "ok", "value": 1}
+
+    response = await auth.get_authenticated(
+        _GET_PATH, {"did": "fake-did", "lang": "EN"}, headers={"x-extra": "1"}
+    )
+
+    assert response == {"ret": "ok", "value": 1}
+    request = api.requests["get_endpoint"][0]
+    assert request.method == hdrs.METH_GET
+    assert request.path == f"/api/{_GET_PATH}"
+    assert request.json is None
+    assert request.query["did"] == "fake-did"
+    assert request.query["lang"] == "EN"
+    # the app sends the auth object as a compact json string, keys in this order
+    assert request.query["auth"] == (
+        '{"with":"users","userid":"user-id","realm":"ecouser.net",'
+        f'"token":"portal-token","resource":"{_DEVICE_ID}"}}'
+    )
+    headers = request.headers
+    timestamp = headers["ts"]
+    assert timestamp.isdigit()
+    assert abs(int(timestamp) - time.time() * 1000) < 60_000
+    assert (
+        headers["sign"]
+        == hashlib.sha1(
+            (_APP_SIGN_SALT + timestamp).encode(), usedforsecurity=False
+        ).hexdigest()
+    )
+    assert headers["appid"] == "ecovacs"
+    assert headers["plat"] == "android"
+    assert headers["token"] == "portal-token"  # noqa: S105
+    assert headers["Authorization"] == "Bearer portal-token"
+    assert headers["userid"] == "user-id"
+    assert headers["v"] == "3.17.2"
+    assert headers["country"] == "us"
+    assert headers["lang"] == "EN"
+    assert headers["Accept"] == "application/json"
+    assert headers["Content-Type"] == "application/json"
+    assert headers["x-extra"] == "1"
+
+
+async def test_get_authenticated_does_not_log_secrets(
+    api: _FakeEcovacsApi, auth: Authenticator, caplog: pytest.LogCaptureFixture
+) -> None:
+    api.responses["get_endpoint"] = {
+        "ret": "ok",
+        "credentials": {"AccessKeyId": "fake-key-id", "SecretAccessKey": "fake-sk"},
+    }
+    await auth.authenticate()
+    caplog.clear()
+
+    with caplog.at_level(logging.DEBUG):
+        await auth.get_authenticated(_GET_PATH, {"pwd": _PIN_PARAM})
+
+    assert "get_endpoint" in caplog.text
+    _assert_no_secret(caplog.text)
+    assert "fake-key-id" not in caplog.text
+    assert "fake-sk" not in caplog.text
+
+
+@pytest.mark.parametrize("status", [404, 204])
+async def test_get_authenticated_http_error_hides_query(
+    api: _FakeEcovacsApi,
+    auth: Authenticator,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+) -> None:
+    if status != 404:
+        api.statuses["get_endpoint"].append(status)
+
+    with (
+        caplog.at_level(logging.DEBUG),
+        pytest.raises(ApiError) as exc_info,
+    ):
+        await auth.get_authenticated(_GET_PATH, {"pwd": _PIN_PARAM})
+
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, ClientResponseError)
+    assert cause.status == status
+    assert cause.request_info.real_url.path == f"/api/{_GET_PATH}"
+    assert not cause.request_info.real_url.query_string
+    assert not cause.request_info.url.query_string
+    assert not cause.request_info.headers
+    assert exc_info.value.__context__ is None or exc_info.value.__context__ is cause
+    for text in (str(exc_info.value), str(cause), repr(cause), caplog.text):
+        _assert_no_secret(text)
+
+
+async def test_get_authenticated_retries_on_bad_gateway(
+    api: _FakeEcovacsApi, auth: Authenticator
+) -> None:
+    api.responses["get_endpoint"] = {"ret": "ok"}
+    api.statuses["get_endpoint"].append(HTTPStatus.BAD_GATEWAY)
+
+    with patch(
+        "deebot_client.authentication.asyncio.sleep", new_callable=AsyncMock
+    ) as sleep:
+        assert await auth.get_authenticated(_GET_PATH, {}) == {"ret": "ok"}
+
+    sleep.assert_awaited_once_with(10)
+    assert len(api.requests["get_endpoint"]) == 2
+
+
+async def test_get_authenticated_gives_up_after_retries(
+    api: _FakeEcovacsApi, auth: Authenticator
+) -> None:
+    api.statuses["get_endpoint"].extend([HTTPStatus.BAD_GATEWAY] * 3)
+
+    with (
+        patch("deebot_client.authentication.asyncio.sleep", new_callable=AsyncMock),
+        pytest.raises(ApiError, match="Unknown error occurred"),
+    ):
+        await auth.get_authenticated(_GET_PATH, {})
+
+
+async def test_get_authenticated_rejects_non_object_response(
+    api: _FakeEcovacsApi, auth: Authenticator
+) -> None:
+    api.responses["get_endpoint"] = ["not", "an", "object"]
+
+    with pytest.raises(ApiError, match="Invalid response"):
+        await auth.get_authenticated(_GET_PATH, {})
+
+
+async def test_get_authenticated_timeout(
+    auth: Authenticator, session: ClientSession
+) -> None:
+    await auth.authenticate()
+
+    with (
+        patch.object(session, "request", side_effect=TimeoutError),
+        pytest.raises(ApiTimeoutError, match=_GET_PATH),
+    ):
+        await auth.get_authenticated(_GET_PATH, {"pwd": _PIN_PARAM})

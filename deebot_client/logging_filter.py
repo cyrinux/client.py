@@ -11,11 +11,16 @@ class SanitizeFilter(Filter):
 
     # all lowercase
     _SANITIZE_LOG_KEYS = (
+        "accesskey",
         "auth",
+        "credential",
         "did",
         "email",
         "login",
         "mobile",
+        "password",
+        "pwd",
+        "secret",
         "token",
         "uid",
         "user",

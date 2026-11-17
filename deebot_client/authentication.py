@@ -5,12 +5,20 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import dataclass
+import hashlib
 from http import HTTPStatus
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urljoin
 
-from aiohttp import ClientResponseError, ClientSession, ClientTimeout, hdrs
+from aiohttp import (
+    ClientResponseError,
+    ClientSession,
+    ClientTimeout,
+    RequestInfo,
+    hdrs,
+)
+from multidict import CIMultiDict, CIMultiDictProxy
 import orjson
 
 from .const import COUNTRY_CHINA, PATH_API_USERS_USER, REALM
@@ -54,6 +62,9 @@ _META = {
 _ANDROID_MODEL = "Pixel 7"
 _ANDROID_SYSTEM = "Android 14"
 MAX_RETRIES = 3
+# Public constant of the app, used to sign the app requests
+_APP_SIGN_SALT = "ecovacs2ea31cf06e6711eaa0aff7b9558a534e"
+_APP_VERSION = "3.17.2"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -398,77 +409,173 @@ class _AuthClient:
         credentials: Credentials | None = None,
     ) -> dict[str, Any]:
         """Perform a post request."""
-        url = urljoin(self._config.portal_url, "api/" + path)
-        logger_request_params = f"url={url}, params={query_params}, json={json}"
-
         if credentials is not None:
-            json.update(
-                {
-                    "auth": {
-                        "with": "users",
-                        "userid": credentials.user_id,
-                        "realm": REALM,
-                        "token": credentials.token,
-                        "resource": self._config.device_id,
-                    }
-                }
-            )
+            json.update({"auth": self.__auth_payload(credentials)})
+
+        return await self.__request(
+            hdrs.METH_POST, path, params=query_params, json=json, headers=headers
+        )
+
+    async def get(
+        self,
+        path: str,
+        params: Mapping[str, str],
+        *,
+        headers: Mapping[str, str] | None = None,
+        credentials: Credentials | None = None,
+    ) -> dict[str, Any]:
+        """Perform a get request.
+
+        With credentials, the request is authenticated as the app does it: the
+        auth object is sent as a json string in the query and the app headers
+        are added.
+        """
+        query = dict(params)
+        request_headers = dict(headers or {})
+        if credentials is not None:
+            query["auth"] = orjson.dumps(self.__auth_payload(credentials)).decode()
+            request_headers = {**self.__app_headers(credentials), **request_headers}
+
+        return await self.__request(
+            hdrs.METH_GET, path, params=query, headers=request_headers
+        )
+
+    def __auth_payload(self, credentials: Credentials) -> dict[str, str]:
+        # The key order matches the app, as the get requests send it as a string
+        return {
+            "with": "users",
+            "userid": credentials.user_id,
+            "realm": REALM,
+            "token": credentials.token,
+            "resource": self._config.device_id,
+        }
+
+    def __app_headers(self, credentials: Credentials) -> dict[str, str]:
+        timestamp = str(int(time.time() * 1000))
+        sign = hashlib.sha1(
+            (_APP_SIGN_SALT + timestamp).encode(), usedforsecurity=False
+        ).hexdigest()
+        return {
+            hdrs.CONTENT_TYPE: "application/json",
+            hdrs.ACCEPT: "application/json",
+            "appid": "ecovacs",
+            "plat": "android",
+            "ts": timestamp,
+            "sign": sign,
+            "token": credentials.token,
+            hdrs.AUTHORIZATION: f"Bearer {credentials.token}",
+            "userid": credentials.user_id,
+            "v": _APP_VERSION,
+            "country": self._config.country.lower(),
+            "lang": _META["lang"],
+        }
+
+    async def __request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None,
+        headers: Mapping[str, Any] | None,
+        json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Perform a portal api request, retrying on a bad gateway.
+
+        Errors never carry the query or the request headers, as they may hold
+        credentials.
+        """
+        url = urljoin(self._config.portal_url, "api/" + path)
 
         for i in range(MAX_RETRIES):
+            # The values are passed as arguments, so the filter can sanitize them
             _LOGGER.debug(
-                "Calling api(%d/%d): %s",
+                "Calling api(%d/%d): %s %s, params=%s, json=%s",
                 i + 1,
                 MAX_RETRIES,
-                logger_request_params,
+                method,
+                url,
+                params,
+                json,
             )
 
             try:
-                async with self._config.session.post(
-                    url,
-                    json=json,
-                    params=query_params,
-                    headers=headers,
-                    timeout=_TIMEOUT,
-                ) as res:
-                    res.raise_for_status()
+                return await self.__request_once(method, url, params, headers, json)
+            except TimeoutError as ex:
+                _LOGGER.debug("Timeout (%s) reached on path: %s", _TIMEOUT, path)
+                raise ApiTimeoutError(path=path, timeout=_TIMEOUT) from ex
+            except ClientResponseError as ex:
+                _LOGGER.debug("Error calling api %s: HTTP %s", url, ex.status)
+                # Raised outside of the handler, so the original error (with
+                # the query) does not become the context of the api error
+                failure = _redact_response_error(ex)
 
-                    if res.status == HTTPStatus.OK:
-                        response_data: dict[str, Any] = await res.json()
-                        _LOGGER.debug(
-                            "Success calling api %s, response=%s",
-                            logger_request_params,
-                            response_data,
-                        )
-                        return response_data
+            if failure.status != HTTPStatus.BAD_GATEWAY:
+                raise ApiError("Request failed") from failure
 
-                    _LOGGER.debug(
-                        "Error calling api %s, response=%s", logger_request_params, res
-                    )
-                    raise ApiError("Request failed") from ClientResponseError(
+            seconds_to_sleep = 10
+            _LOGGER.info(
+                "Retry calling API due 502: Unfortunately the ecovacs api is unreliable. Retrying in %d seconds",
+                seconds_to_sleep,
+            )
+            await asyncio.sleep(seconds_to_sleep)
+
+        raise ApiError("Unknown error occurred")
+
+    async def __request_once(
+        self,
+        method: str,
+        url: str,
+        params: Mapping[str, Any] | None,
+        headers: Mapping[str, Any] | None,
+        json: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        async with self._config.session.request(
+            method,
+            url,
+            json=json,
+            params=params,
+            headers=headers,
+            timeout=_TIMEOUT,
+        ) as res:
+            res.raise_for_status()
+
+            if res.status != HTTPStatus.OK:
+                _LOGGER.debug("Error calling api %s, status=%s", url, res.status)
+                raise ApiError("Request failed") from _redact_response_error(
+                    ClientResponseError(
                         res.request_info,
                         res.history,
                         status=res.status,
                         message=str(res.reason),
                         headers=res.headers,
                     )
-            except TimeoutError as ex:
-                _LOGGER.debug("Timeout (%d) reached on path: %s", _TIMEOUT, path)
-                raise ApiTimeoutError(path=path, timeout=_TIMEOUT) from ex
-            except ClientResponseError as ex:
-                _LOGGER.debug("Error: %s", logger_request_params, exc_info=True)
-                if ex.status == HTTPStatus.BAD_GATEWAY:
-                    seconds_to_sleep = 10
-                    _LOGGER.info(
-                        "Retry calling API due 502: Unfortunately the ecovacs api is unreliable. Retrying in %d seconds",
-                        seconds_to_sleep,
-                    )
+                )
 
-                    await asyncio.sleep(seconds_to_sleep)
-                    continue
+            # The get endpoints do not always declare json as content type
+            response_data = await res.json(
+                content_type=None if method == hdrs.METH_GET else "application/json"
+            )
+            if not isinstance(response_data, dict):
+                raise ApiError("Invalid response")
+            _LOGGER.debug("Success calling api %s, response=%s", url, response_data)
+            return response_data
 
-                raise ApiError from ex
 
-        raise ApiError("Unknown error occurred")
+def _redact_response_error(error: ClientResponseError) -> ClientResponseError:
+    """Return a copy of the error without the query and the request headers."""
+    info = error.request_info
+    return ClientResponseError(
+        RequestInfo(
+            url=info.url.with_query(None),
+            method=info.method,
+            headers=CIMultiDictProxy(CIMultiDict()),
+            real_url=info.real_url.with_query(None),
+        ),
+        (),
+        status=error.status,
+        message=error.message,
+        headers=error.headers,
+    )
 
 
 class Authenticator:
@@ -600,6 +707,21 @@ class Authenticator:
             path,
             json,
             query_params=query_params,
+            headers=headers,
+            credentials=await self.authenticate(),
+        )
+
+    async def get_authenticated(
+        self,
+        path: str,
+        params: Mapping[str, str],
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Perform an authenticated get request, as the app does."""
+        return await self._auth_client.get(
+            path,
+            params,
             headers=headers,
             credentials=await self.authenticate(),
         )
