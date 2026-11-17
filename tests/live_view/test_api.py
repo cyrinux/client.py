@@ -84,7 +84,7 @@ async def test_start_watch_with_pin(authenticator: Mock) -> None:
     assert len(track_id) == 10
     assert set(track_id) <= set(string.ascii_letters + string.digits)
     assert params == {
-        "lang": "EN",
+        "lang": "en",
         "plat": "Android",
         "av": "2.1.0",
         "did": "fake-device-id",
@@ -273,7 +273,7 @@ async def test_end_watch(authenticator: Mock) -> None:
         PATH_API_APPSVR_AKVS_END_WATCH,
         {
             "videoTrackId": session.track_id,
-            "lang": "EN",
+            "lang": "en",
             "plat": "Android",
             "av": "2.1.0",
             "sid": "fake-session-id",

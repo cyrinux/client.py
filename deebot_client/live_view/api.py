@@ -63,7 +63,7 @@ async def start_watch(
     device_info: ApiDeviceInfo,
     pin: str | None,
     *,
-    lang: str = "EN",
+    lang: str = "en",
 ) -> LiveViewSession:
     """Start a live view session; the robot starts its camera.
 
@@ -97,7 +97,7 @@ async def end_watch(
     authenticator: Authenticator,
     session: LiveViewSession,
     *,
-    lang: str = "EN",
+    lang: str = "en",
 ) -> None:
     """End a live view session."""
     params = {
