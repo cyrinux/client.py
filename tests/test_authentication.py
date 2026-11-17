@@ -676,6 +676,7 @@ async def test_get_authenticated_does_not_log_secrets(
     api.responses["get_endpoint"] = {
         "ret": "ok",
         "credentials": {"AccessKeyId": "fake-key-id", "SecretAccessKey": "fake-sk"},
+        "session": "fake-session-id",
     }
     await auth.authenticate()
     caplog.clear()
@@ -687,6 +688,7 @@ async def test_get_authenticated_does_not_log_secrets(
     _assert_no_secret(caplog.text)
     assert "fake-key-id" not in caplog.text
     assert "fake-sk" not in caplog.text
+    assert "fake-session-id" not in caplog.text
 
 
 @pytest.mark.parametrize("status", [404, 204])
@@ -763,3 +765,45 @@ async def test_get_authenticated_timeout(
         pytest.raises(ApiTimeoutError, match=_GET_PATH),
     ):
         await auth.get_authenticated(_GET_PATH, {"pwd": _PIN_PARAM})
+
+
+async def test_post_authenticated_adds_auth_to_the_body(
+    api: _FakeEcovacsApi, auth: Authenticator, caplog: pytest.LogCaptureFixture
+) -> None:
+    api.responses["post_endpoint"] = {"ret": "ok"}
+
+    with caplog.at_level(logging.DEBUG):
+        response = await auth.post_authenticated(
+            "appsvr/fake/post_endpoint", {"cmd": "x"}, query_params={"did": "fake-did"}
+        )
+
+    assert response == {"ret": "ok"}
+    request = api.requests["post_endpoint"][0]
+    assert request.method == hdrs.METH_POST
+    assert request.query == {"did": "fake-did"}
+    assert request.json == {
+        "cmd": "x",
+        "auth": {
+            "with": "users",
+            "userid": "user-id",
+            "realm": "ecouser.net",
+            "token": "portal-token",
+            "resource": _DEVICE_ID,
+        },
+    }
+    assert "portal-token" not in caplog.text
+    assert "fake-did" not in caplog.text
+
+
+async def test_get_without_credentials_sends_no_auth(
+    api: _FakeEcovacsApi, auth: Authenticator
+) -> None:
+    api.responses["get_endpoint"] = {"ret": "ok"}
+
+    response = await auth._auth_client.get(_GET_PATH, {"lang": "EN"})
+
+    assert response == {"ret": "ok"}
+    request = api.requests["get_endpoint"][0]
+    assert request.query == {"lang": "EN"}
+    assert "token" not in request.headers
+    assert "sign" not in request.headers

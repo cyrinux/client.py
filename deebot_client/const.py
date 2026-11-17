@@ -7,6 +7,9 @@ from typing import Self
 
 REALM = "ecouser.net"
 PATH_API_APPSVR_APP = "appsvr/app.do"
+PATH_API_APPSVR_AKVS_START_WATCH = "appsvr/akvs/start_watch"
+PATH_API_APPSVR_AKVS_START_WATCH_V2 = "appsvr/akvs/start_watch/v2"
+PATH_API_APPSVR_AKVS_END_WATCH = "appsvr/akvs/end_watch"
 PATH_API_PIM_PRODUCT_IOT_MAP = "pim/product/getProductIotMap"
 PATH_API_IOT_DEVMANAGER = "iot/devmanager.do"
 PATH_API_LG_LOG = "lg/log.do"

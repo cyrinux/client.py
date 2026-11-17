@@ -21,6 +21,7 @@ class SanitizeFilter(Filter):
         "password",
         "pwd",
         "secret",
+        "session",
         "token",
         "uid",
         "user",
